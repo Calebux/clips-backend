@@ -31,6 +31,16 @@ export interface BulkUpdateResult {
   allClipsProcessed: boolean;
 }
 
+export interface BulkUpdateResult {
+  updatedCount: number;
+  /** Summary of the applied changes */
+  updates: { selected?: boolean; postStatus?: unknown };
+  /** IDs that were not found or did not belong to the user */
+  notFoundIds: string[];
+  /** True when every clip for the affected video(s) now has postStatus = 'posted' */
+  allClipsProcessed: boolean;
+}
+
 @Injectable()
 export class ClipsService {
   private readonly logger = new Logger(ClipsService.name);
@@ -149,7 +159,9 @@ export class ClipsService {
   }
 
   /**
-   * List clips with optional filtering and sorting.
+   * Bulk update clip status in a single (simulated) transaction.
+   *
+   * When Prisma is wired up, replace the in-memory mutation block with:
    *
    * sortBy options:
    *   viralityScore (default) — highest viral potential first
@@ -159,6 +171,79 @@ export class ClipsService {
    * statusFilter options:
    *   pending, processing, success, failed
    */
+  async bulkUpdate(
+    userId: string,
+    dto: BulkUpdateClipsDto,
+  ): Promise<BulkUpdateResult> {
+    if (dto.selected === undefined && dto.postStatus === undefined) {
+      throw new BadRequestException('At least one of selected or postStatus must be provided');
+    }
+
+    // ── Ownership validation ──────────────────────────────────────────────────
+    const notFoundIds: string[] = [];
+    const validClips: Clip[] = [];
+
+    for (const id of dto.clipIds) {
+      const clip = this.clips.find((c) => c.id === id);
+      if (!clip) {
+        notFoundIds.push(id);
+        continue;
+      }
+      if (clip.userId !== userId) {
+        // Treat as not-found to avoid leaking existence of other users' clips
+        notFoundIds.push(id);
+        continue;
+      }
+      validClips.push(clip);
+    }
+
+    if (validClips.length === 0) {
+      throw new ForbiddenException(
+        'None of the provided clipIds belong to this user or exist',
+      );
+    }
+
+    // ── Simulated transaction — atomic in-memory mutation ────────────────────
+    const patch: Partial<Pick<Clip, 'selected' | 'postStatus' | 'updatedAt'>> = {
+      updatedAt: new Date(),
+    };
+    if (dto.selected !== undefined) patch.selected = dto.selected;
+    if (dto.postStatus !== undefined) patch.postStatus = dto.postStatus as PostStatus;
+
+    for (const clip of validClips) {
+      Object.assign(clip, patch);
+    }
+
+    // ── Video completion check ────────────────────────────────────────────────
+    // Collect distinct videoIds touched by this update
+    const affectedVideoIds = [...new Set(validClips.map((c) => c.videoId))];
+    let allClipsProcessed = false;
+
+    for (const videoId of affectedVideoIds) {
+      const videoClips = this.clips.filter((c) => c.videoId === videoId);
+      const allPosted = videoClips.every((c) => c.postStatus === 'posted');
+
+      if (allPosted) {
+        allClipsProcessed = true;
+        const payload: AllClipsProcessedPayload = {
+          videoId,
+          clipCount: videoClips.length,
+        };
+        this.eventEmitter.emit(ALL_CLIPS_PROCESSED_EVENT, payload);
+      }
+    }
+
+    return {
+      updatedCount: validClips.length,
+      updates: {
+        ...(dto.selected !== undefined && { selected: dto.selected }),
+        ...(dto.postStatus !== undefined && { postStatus: dto.postStatus }),
+      },
+      notFoundIds,
+      allClipsProcessed,
+    };
+  }
+
   listClips(options: ListClipsOptions = {}): Clip[] {
     const {
       videoId,
