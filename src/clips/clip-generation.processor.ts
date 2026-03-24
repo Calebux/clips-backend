@@ -1,8 +1,16 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Logger } from '@nestjs/common';
+import { Processor, WorkerHost, OnWorkerEvent } from '@nestjs/bullmq';
+import { Job } from 'bullmq';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Clip } from './clip.entity';
 import { calculateViralityScore } from './virality-score.util';
 import { cutClip } from './ffmpeg.util';
 import { CloudinaryService } from './cloudinary.service';
+import { CLIP_GENERATION_QUEUE } from './clip-generation.queue';
+import {
+  CLIP_GENERATION_FAILED_EVENT,
+  ClipGenerationFailedPayload,
+} from './clips.events';
 
 export interface ClipGenerationJob {
   videoId: string;
@@ -28,81 +36,81 @@ export interface ClipProcessingResult {
 }
 
 /**
- * Clip-generation processor.
+ * BullMQ processor for clip-generation jobs.
  *
- * Currently runs synchronously as a plain NestJS provider.
- * When a queue is introduced, convert this to a BullMQ @Processor class
- * and decorate `process()` with @Process() — the scoring logic stays unchanged.
+ * Retry configuration (set per-job in ClipsService.enqueueClip via CLIP_JOB_OPTIONS):
+ *   attempts : 3   — 1 initial attempt + 2 automatic retries
+ *   backoff  : exponential, starting at 1 000 ms
+ *              attempt 2 → ~1 000 ms wait
+ *              attempt 3 → ~2 000 ms wait
  *
- * After FFmpeg cuts a clip:
- * 1. Uploads to Cloudinary for CDN delivery
- * 2. Generates and saves thumbnail URL
- * 3. Deletes local temporary file
- * 4. Handles errors with retry support
+ * After FFmpeg cuts a clip, uploads to Cloudinary for reliable CDN delivery:
+ *   1. Uploads video buffer using upload_stream
+ *   2. Generates auto-thumbnail at 50% video position
+ *   3. Deletes local temporary file after success
+ *   4. Handles errors with BullMQ retries (exponential backoff)
+ *
+ * After all 3 attempts fail, BullMQ moves the job to the failed set and
+ * fires the 'failed' worker event, handled by @OnWorkerEvent('failed') below.
  */
-@Injectable()
-export class ClipGenerationProcessor {
+@Processor(CLIP_GENERATION_QUEUE)
+export class ClipGenerationProcessor extends WorkerHost {
   private readonly logger = new Logger(ClipGenerationProcessor.name);
-  private readonly maxRetries = 3;
 
-  constructor(private readonly cloudinaryService: CloudinaryService) {}
+  constructor(
+    private readonly cloudinaryService: CloudinaryService,
+    private readonly eventEmitter: EventEmitter2,
+  ) {
+    super();
+  }
 
-  async process(job: ClipGenerationJob): Promise<Clip> {
-    const durationSeconds = job.endTime - job.startTime;
-    const clipId = `${job.videoId}-${job.startTime}-${job.endTime}`;
+  /** Main job handler — called by BullMQ on each attempt */
+  async process(job: Job<ClipGenerationJob>): Promise<Clip> {
+    const data = job.data;
+    const durationSeconds = data.endTime - data.startTime;
+    const clipId = `${data.videoId}-${data.startTime}-${data.endTime}`;
+
+    this.logger.log(
+      `Processing clip job ${job.id} — attempt ${job.attemptsMade + 1}/${job.opts.attempts ?? 1} ` +
+        `videoId=${data.videoId}`,
+    );
 
     try {
-      // Cut the video file — float startTime/endTime are handled safely inside cutClip
+      // FFmpeg cut — may throw transiently (OOM, network mount, etc.)
       this.logger.log(`Starting clip generation: ${clipId}`);
       await cutClip({
-        inputPath: job.inputPath,
-        outputPath: job.outputPath,
-        startTime: job.startTime,
-        endTime: job.endTime,
-        videoDuration: job.videoDuration,
+        inputPath: data.inputPath,
+        outputPath: data.outputPath,
+        startTime: data.startTime,
+        endTime: data.endTime,
+        videoDuration: data.videoDuration,
       });
 
       const viralityScore = calculateViralityScore({
         durationSeconds,
-        positionRatio: job.positionRatio,
-        transcript: job.transcript,
+        positionRatio: data.positionRatio,
+        transcript: data.transcript,
       });
 
       this.logger.log(
-        `Clip cut successfully — videoId=${job.videoId} ` +
+        `Clip cut successfully — videoId=${data.videoId} ` +
           `duration=${durationSeconds}s ` +
-          `position=${(job.positionRatio * 100).toFixed(0)}% ` +
+          `position=${(data.positionRatio * 100).toFixed(0)}% ` +
           `viralityScore=${viralityScore}`,
       );
 
-      // Upload to Cloudinary with retry logic
-      const uploadResult = await this.uploadWithRetry(
-        job.outputPath,
+      // Upload to Cloudinary
+      const uploadResult = await this.uploadToCloudinary(
+        data.outputPath,
         clipId,
-        0,
       );
 
       if (uploadResult.error) {
-        this.logger.error(
-          `Failed to upload clip after ${this.maxRetries} retries: ${uploadResult.error}`,
-        );
-
-        return {
-          id: clipId,
-          videoId: job.videoId,
-          startTime: job.startTime,
-          endTime: job.endTime,
-          positionRatio: job.positionRatio,
-          transcript: job.transcript,
-          viralityScore,
-          status: 'failed',
-          error: uploadResult.error,
-          createdAt: new Date(),
-        };
+        throw new Error(`Cloudinary upload failed: ${uploadResult.error}`);
       }
 
       // Delete local temporary file after successful upload
-      await this.cloudinaryService.deleteLocalFile(job.outputPath);
+      await this.cloudinaryService.deleteLocalFile(data.outputPath);
 
       this.logger.log(
         `Clip processing complete: ${clipId} → ${uploadResult.secure_url}`,
@@ -110,57 +118,49 @@ export class ClipGenerationProcessor {
 
       return {
         id: clipId,
-        videoId: job.videoId,
-        startTime: job.startTime,
-        endTime: job.endTime,
-        positionRatio: job.positionRatio,
-        transcript: job.transcript,
+        videoId: data.videoId,
+        userId: '', // populated by ClipsService after dequeue
+        startTime: data.startTime,
+        endTime: data.endTime,
+        positionRatio: data.positionRatio,
+        transcript: data.transcript,
         viralityScore,
         clipUrl: uploadResult.secure_url,
         thumbnail: uploadResult.thumbnail_url,
         status: 'success',
+        selected: false,
+        postStatus: null,
         createdAt: new Date(),
+        updatedAt: new Date(),
       };
     } catch (error) {
       this.logger.error(
-        `Clip generation failed for ${clipId}: ${error.message}`,
-        error.stack,
+        `Clip generation failed for ${clipId}: ${(error as any).message}`,
+        (error as any).stack,
       );
 
       // Attempt cleanup of local file
       try {
-        await this.cloudinaryService.deleteLocalFile(job.outputPath);
+        await this.cloudinaryService.deleteLocalFile(data.outputPath);
       } catch (cleanupError) {
         this.logger.warn(
-          `Cleanup failed for ${job.outputPath}: ${cleanupError.message}`,
+          `Cleanup failed for ${data.outputPath}: ${(cleanupError as any).message}`,
         );
       }
 
-      return {
-        id: clipId,
-        videoId: job.videoId,
-        startTime: job.startTime,
-        endTime: job.endTime,
-        positionRatio: job.positionRatio,
-        transcript: job.transcript,
-        viralityScore: null,
-        status: 'failed',
-        error: error.message,
-        createdAt: new Date(),
-      };
+      // Re-throw to trigger BullMQ retry logic
+      throw error;
     }
   }
 
   /**
-   * Upload clip to Cloudinary with exponential backoff retry
+   * Upload clip to Cloudinary
    * @param filePath - Path to clip file
    * @param clipId - Unique clip identifier
-   * @param retryCount - Current retry attempt
    */
-  private async uploadWithRetry(
+  private async uploadToCloudinary(
     filePath: string,
     clipId: string,
-    retryCount: number = 0,
   ): Promise<any> {
     try {
       const buffer = await this.cloudinaryService.readFileToBuffer(filePath);
@@ -175,30 +175,48 @@ export class ClipGenerationProcessor {
 
       return result;
     } catch (error) {
-      if (retryCount < this.maxRetries) {
-        const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
-        this.logger.warn(
-          `Upload failed for ${clipId}, retry ${retryCount + 1}/${this.maxRetries} in ${delay}ms`,
-        );
-        await this.sleep(delay);
-        return this.uploadWithRetry(filePath, clipId, retryCount + 1);
-      }
-
       this.logger.error(
-        `All upload retries exhausted for ${clipId}: ${error.message}`,
+        `Upload to Cloudinary failed for ${clipId}: ${(error as any).message}`,
       );
-      return {
-        secure_url: '',
-        public_id: clipId,
-        error: error.message,
-      };
+      throw error;
     }
   }
 
   /**
-   * Sleep utility for retry delays
+   * Called by BullMQ after a job has exhausted ALL retry attempts.
+   *
+   * Responsibilities:
+   *  1. Log the terminal failure with job.failedReason
+   *  2. Emit CLIP_GENERATION_FAILED_EVENT so listeners can:
+   *     - Set Video.status = 'failed' and Video.processingError = failedReason
+   *     - Trigger a user notification (email / push — future work)
+   *
+   * NOTE: this handler fires only on the FINAL failure, not on intermediate
+   * retries. Intermediate failures are handled silently by BullMQ's backoff.
    */
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  @OnWorkerEvent('failed')
+  onFailed(job: Job<ClipGenerationJob>, error: Error): void {
+    const isFinalAttempt = job.attemptsMade >= (job.opts.attempts ?? 1);
+
+    this.logger.error(
+      `Clip job ${job.id} failed — ` +
+        `attempt ${job.attemptsMade}/${job.opts.attempts ?? 1} — ` +
+        `reason: ${error.message}`,
+    );
+
+    if (!isFinalAttempt) {
+      // Intermediate failure — BullMQ will retry with backoff; nothing else to do
+      return;
+    }
+
+    // Final failure — notify the rest of the system
+    const payload: ClipGenerationFailedPayload = {
+      jobId: job.id,
+      videoId: job.data.videoId,
+      failedReason: job.failedReason ?? error.message,
+      attemptsMade: job.attemptsMade,
+    };
+
+    this.eventEmitter.emit(CLIP_GENERATION_FAILED_EVENT, payload);
   }
 }
