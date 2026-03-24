@@ -4,6 +4,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { GoogleStrategy } from './strategies/google.strategy';
+import { IsStrongPasswordConstraint } from './validators/is-strong-password.validator';
 
 @Module({
   imports: [
@@ -22,6 +23,6 @@ import { GoogleStrategy } from './strategies/google.strategy';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, GoogleStrategy],
+  providers: [AuthService, GoogleStrategy, IsStrongPasswordConstraint],
 })
 export class AuthModule {}

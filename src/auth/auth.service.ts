@@ -1,6 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, BadRequestException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../prisma/prisma.service';
+import * as bcrypt from 'bcrypt';
+import { SignupDto } from './dto/signup.dto';
 
 type JwtUser = { id: number; email: string | null };
 
@@ -65,5 +67,46 @@ export class AuthService {
       expiresIn: refreshSeconds,
     });
     return { accessToken, refreshToken };
+  }
+
+  async signup(signupDto: SignupDto) {
+    const { email, password } = signupDto;
+
+    // Check if user already exists
+    const existingUser = await this.prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (existingUser) {
+      throw new BadRequestException('Email already registered');
+    }
+
+    // Hash the password
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+    // Create new user
+    const user = await this.prisma.user.create({
+      data: {
+        email,
+        password: hashedPassword,
+      },
+    });
+
+    // Issue tokens
+    const tokens = this.issueTokens({
+      id: user.id,
+      email: user.email,
+    });
+
+    return {
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        picture: user.picture,
+      },
+      tokens,
+    };
   }
 }
