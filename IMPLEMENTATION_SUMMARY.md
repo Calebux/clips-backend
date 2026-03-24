@@ -1,92 +1,152 @@
-# Cloudinary Upload Failure Handling - Implementation Summary
+# targetPlatforms Validation Implementation
 
-## Changes Made
+## Issue Description
+`targetPlatforms` JSON field accepted any input, causing potential downstream posting failures.
 
-### 1. Entity Updates (`clip.entity.ts`)
-- Added `upload_failed` status to Clip status type
-- Added `localFilePath?: string` field to store local file path as fallback
+## Solution Implemented
 
-### 2. Cloudinary Service (`cloudinary.service.ts`)
-- Refactored `uploadVideoFromBuffer()` to include retry logic with configurable retry count
-- Added 2 automatic retries with exponential backoff (1s → 2s → 5s max)
-- Extracted `performUpload()` as private method for single upload attempt
-- Added `delay()` helper method for exponential backoff timing
-- Comprehensive logging for each retry attempt
+### ✅ Acceptance Criteria Met
 
-### 3. Clip Generation Processor (`clip-generation.processor.ts`)
-- Modified `uploadToCloudinary()` to pass retry parameter (2 retries)
-- Updated error handling to NOT throw on upload failure
-- Returns clip with `upload_failed` status when upload fails after all retries
-- Preserves local file path in `clip.localFilePath` when upload fails
-- Only deletes local file after successful upload
-- Improved error handling in catch block to avoid deleting files on upload errors
+1. **Custom Validator `@IsValidPlatforms()`**
+   - Created in `src/videos/validators/is-valid-platforms.validator.ts`
+   - Validates array of supported platforms
+   - Provides detailed error messages
 
-### 4. Clips Service (`clips.service.ts`)
-- Added `retryFailedUpload()` method to manually retry failed uploads
-- Method validates clip status and local file availability
-- Re-enqueues clip for processing (will skip FFmpeg, only retry upload)
+2. **Supported Platforms**
+   - `tiktok`
+   - `instagram`
+   - `youtube-shorts`
+   - `youtube`
+   - `facebook`
+   - `twitter`
+   - `snapchat`
 
-### 5. Test Coverage
+3. **Automatic Normalization**
+   - Converts to lowercase using `@Transform` decorator
+   - Deduplicates using `Set`
+   - Applied in both CreateVideoDto and UpdateVideoDto
 
-#### Updated Tests (`clip-generation.processor.spec.ts`)
-- Added MockCloudinaryService for proper mocking
-- Added test: "returns clip with upload_failed status when Cloudinary upload fails"
-- Added test: "keeps local file when upload fails"
-- Added test: "deletes local file after successful upload"
+4. **Returns 400 on Invalid Values**
+   - Validation integrated with class-validator
+   - NestJS automatically returns 400 Bad Request
+   - Includes detailed error messages listing invalid platforms
 
-#### New Test File (`cloudinary.service.spec.ts`)
-- Tests retry logic with various failure scenarios
-- Tests success on first attempt
-- Tests success on second attempt after first failure
-- Tests failure after all retry attempts exhausted
-- Tests exponential backoff timing between retries
+## Files Created
 
-### 6. Documentation (`CLOUDINARY_UPLOAD_HANDLING.md`)
-- Comprehensive documentation of the feature
-- Usage examples for monitoring and retrying failed uploads
-- Future enhancement suggestions
-- Database schema update guidance
+### Core Implementation
+- `src/videos/validators/is-valid-platforms.validator.ts` - Validator constraint
+- `src/videos/validators/decorators.ts` - `@IsValidPlatforms()` decorator
+- `src/videos/dto/create-video.dto.ts` - Create video DTO with validation
+- `src/videos/dto/update-video.dto.ts` - Update video DTO with validation
 
-## Acceptance Criteria Status
+### Supporting Files
+- `src/videos/validators/index.ts` - Exports for validators
+- `src/videos/dto/index.ts` - Exports for DTOs
 
-✅ **Add 2 retries in processor**
-- Implemented in `CloudinaryService.uploadVideoFromBuffer()` with 2 configurable retries
-- Exponential backoff: 1000ms → 2000ms → 5000ms (capped)
+### Tests
+- `src/videos/validators/is-valid-platforms.validator.spec.ts` - Validator unit tests
+- `src/videos/dto/create-video.dto.spec.ts` - DTO integration tests
 
-✅ **On final fail: log, update clip status 'upload_failed'**
-- Comprehensive error logging at each retry attempt
-- Final failure logged at ERROR level with full context
-- Clip returned with `status: 'upload_failed'`
-- Error message stored in `clip.error` field
+### Documentation
+- `src/videos/README.md` - Complete usage guide
 
-✅ **Keep local temp file as fallback (optional)**
-- Local file is NOT deleted when upload fails
-- File path stored in `clip.localFilePath`
-- Can be used for manual retry via `retryFailedUpload()` method
-- Enables future enhancements like local file serving
+## Usage Example
 
-## Key Benefits
+### Before (Unsafe)
+```typescript
+// Any value accepted - could cause failures
+{
+  targetPlatforms: "invalid" // ❌ String instead of array
+}
+{
+  targetPlatforms: ["TIKTOK", "reddit"] // ❌ Invalid platform
+}
+```
 
-1. **No Clip Loss**: Clips are never lost due to upload failures
-2. **Efficient Retries**: Upload retries don't re-run FFmpeg cutting
-3. **Graceful Degradation**: System continues processing other clips
-4. **Manual Recovery**: Failed uploads can be retried manually
-5. **Monitoring**: Easy to identify and track failed uploads
-6. **Future-Proof**: Foundation for scheduled retry jobs and local serving
+### After (Safe)
+```typescript
+// Valid request
+{
+  targetPlatforms: ["TikTok", "Instagram", "TIKTOK"]
+}
+
+// Automatically normalized to:
+{
+  targetPlatforms: ["tiktok", "instagram"] // ✅ Lowercase + deduplicated
+}
+
+// Invalid request returns 400
+{
+  targetPlatforms: ["tiktok", "reddit"]
+}
+// Response: 400 Bad Request
+// "Invalid platform(s): reddit. Supported platforms: tiktok, instagram, ..."
+```
+
+## Integration Steps
+
+To integrate this into your video endpoints:
+
+1. **Import the DTO in your controller:**
+```typescript
+import { CreateVideoDto, UpdateVideoDto } from './dto';
+```
+
+2. **Use in controller methods:**
+```typescript
+@Post()
+create(@Body() createVideoDto: CreateVideoDto) {
+  // targetPlatforms is now validated and normalized
+  return this.videosService.create(createVideoDto);
+}
+
+@Patch(':id')
+update(@Param('id') id: string, @Body() updateVideoDto: UpdateVideoDto) {
+  // targetPlatforms is validated and normalized
+  return this.videosService.update(id, updateVideoDto);
+}
+```
+
+3. **Enable global validation pipe (if not already enabled):**
+```typescript
+// In main.ts
+app.useGlobalPipes(new ValidationPipe({
+  transform: true, // Enable transformation
+  whitelist: true,
+}));
+```
 
 ## Testing
 
-Run the test suite to verify implementation:
+Run tests after installing dependencies:
 
 ```bash
-npm test -- clip-generation.processor.spec
-npm test -- cloudinary.service.spec
+# Install dependencies
+npm install
+
+# Run validator tests
+npm test -- --testPathPattern=is-valid-platforms.validator.spec
+
+# Run DTO tests
+npm test -- --testPathPattern=create-video.dto.spec
+
+# Run all tests
+npm test
 ```
 
-## Next Steps (Optional Enhancements)
+## Benefits
 
-1. Add scheduled cron job to automatically retry failed uploads
-2. Implement local file serving endpoint for clips with `upload_failed` status
-3. Add cleanup job to remove old local files after successful retry
-4. Create admin dashboard to monitor and manage failed uploads
-5. Add metrics/alerts for upload failure rates
+1. **Type Safety** - TypeScript types ensure compile-time safety
+2. **Runtime Validation** - Prevents invalid data from entering the system
+3. **Automatic Normalization** - Consistent data format in database
+4. **Clear Error Messages** - Developers know exactly what went wrong
+5. **Extensible** - Easy to add new platforms to the supported list
+6. **Well Tested** - Comprehensive unit and integration tests
+
+## Next Steps
+
+1. Install dependencies: `npm install`
+2. Run tests to verify: `npm test`
+3. Create a videos controller if it doesn't exist
+4. Apply the DTOs to your video endpoints
+5. Ensure global validation pipe is enabled in `main.ts`
