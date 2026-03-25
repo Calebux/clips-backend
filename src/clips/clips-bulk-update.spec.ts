@@ -26,17 +26,34 @@ function makeClip(overrides: Partial<Clip> = {}): Clip {
 function makeService() {
   const emitter = new EventEmitter2();
   jest.spyOn(emitter, 'emit');
+  const prisma = {
+    clip: {
+      findMany: jest.fn(),
+      findUnique: jest.fn(),
+      update: jest.fn(),
+    },
+  };
   // ClipGenerationProcessor not needed for bulk-update tests
-  const service = new ClipsService(null as any, emitter);
-  return { service, emitter };
+  const service = new ClipsService(null as any, emitter, prisma as any);
+  return { service, emitter, prisma };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('ClipsService.bulkUpdate', () => {
   it('updates selected flag for valid clips', async () => {
-    const { service } = makeService();
-    service._seed([makeClip({ id: 'c1' }), makeClip({ id: 'c2' })]);
+    const { service, prisma } = makeService();
+    const clip1 = makeClip({ id: 'c1' });
+    const clip2 = makeClip({ id: 'c2' });
+    service._seed([clip1, clip2]);
+
+    // Mock findById which now uses prisma
+    (prisma.clip.findUnique as jest.Mock)
+      .mockImplementation(({ where }) => {
+        if (where.id === 'c1') return Promise.resolve(clip1);
+        if (where.id === 'c2') return Promise.resolve(clip2);
+        return Promise.resolve(null);
+      });
 
     const result = await service.bulkUpdate('user-1', {
       clipIds: ['c1', 'c2'],
@@ -45,32 +62,42 @@ describe('ClipsService.bulkUpdate', () => {
 
     expect(result.updatedCount).toBe(2);
     expect(result.notFoundIds).toHaveLength(0);
-    expect(service.findById('c1')!.selected).toBe(true);
-    expect(service.findById('c2')!.selected).toBe(true);
+    expect((await service.findById('c1'))!.selected).toBe(true);
+    expect((await service.findById('c2'))!.selected).toBe(true);
   });
 
   it('updates postStatus for valid clips', async () => {
-    const { service } = makeService();
-    service._seed([makeClip({ id: 'c1' })]);
+    const { service, prisma } = makeService();
+    const clip1 = makeClip({ id: 'c1' });
+    service._seed([clip1]);
+
+    (prisma.clip.findUnique as jest.Mock).mockResolvedValue(clip1);
 
     await service.bulkUpdate('user-1', { clipIds: ['c1'], postStatus: 'posted' });
 
-    expect(service.findById('c1')!.postStatus).toBe('posted');
+    expect((await service.findById('c1'))!.postStatus).toBe('posted');
   });
 
   it('accepts JSON object as postStatus', async () => {
-    const { service } = makeService();
-    service._seed([makeClip({ id: 'c1' })]);
+    const { service, prisma } = makeService();
+    const clip1 = makeClip({ id: 'c1' });
+    service._seed([clip1]);
+    (prisma.clip.findUnique as jest.Mock).mockResolvedValue(clip1);
     const status = { platform: 'tiktok', postId: 'abc', status: 'posted' };
 
     await service.bulkUpdate('user-1', { clipIds: ['c1'], postStatus: status });
 
-    expect(service.findById('c1')!.postStatus).toEqual(status);
+    expect((await service.findById('c1'))!.postStatus).toEqual(status);
   });
 
   it('collects notFoundIds for missing clips', async () => {
-    const { service } = makeService();
-    service._seed([makeClip({ id: 'c1' })]);
+    const { service, prisma } = makeService();
+    const clip1 = makeClip({ id: 'c1' });
+    service._seed([clip1]);
+    (prisma.clip.findUnique as jest.Mock).mockImplementation(({ where }) => {
+      if (where.id === 'c1') return Promise.resolve(clip1);
+      return Promise.resolve(null);
+    });
 
     const result = await service.bulkUpdate('user-1', {
       clipIds: ['c1', 'ghost-id'],
@@ -82,8 +109,10 @@ describe('ClipsService.bulkUpdate', () => {
   });
 
   it('treats clips belonging to another user as not-found (no info leak)', async () => {
-    const { service } = makeService();
-    service._seed([makeClip({ id: 'c1', userId: 'user-2' })]);
+    const { service, prisma } = makeService();
+    const clip1 = makeClip({ id: 'c1', userId: 'user-2' });
+    service._seed([clip1]);
+    (prisma.clip.findUnique as jest.Mock).mockResolvedValue(clip1);
 
     // All requested IDs are owned by another user → ForbiddenException
     await expect(
@@ -91,7 +120,7 @@ describe('ClipsService.bulkUpdate', () => {
     ).rejects.toThrow(ForbiddenException);
 
     // Clip must NOT have been mutated
-    expect(service.findById('c1')!.selected).toBe(false);
+    expect((await service.findById('c1'))!.selected).toBe(false);
   });
 
   it('throws ForbiddenException when no valid clips found', async () => {
