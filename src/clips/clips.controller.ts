@@ -39,27 +39,41 @@ export class ClipsController {
    *
    * Query params:
    *   videoId  — filter to a specific source video
-   *   sortBy   — viralityScore | createdAt | duration  (default: viralityScore)
-   *   order    — asc | desc  (default: desc)
+   *   sort     — field:order (e.g., viralityScore:desc, createdAt:asc)
+   *   sortBy   — legacy support for viralityScore | createdAt | duration
+   *   order    — legacy support for asc | desc
    *
    * Examples:
-   *   GET /clips
-   *   GET /clips?sortBy=viralityScore&order=desc
-   *   GET /clips?videoId=abc123&sortBy=duration&order=asc
+   *   GET /clips?sort=viralityScore:desc
+   *   GET /clips?videoId=abc123&sort=duration:asc
    */
   @Get()
   list(
     @Query('videoId') videoId?: string,
+    @Query('sort') sort?: string,
     @Query('sortBy') sortBy?: ClipSortField,
     @Query('order') order?: SortOrder,
   ) {
-    return this.clipsService.listClips({ videoId, sortBy, order });
+    let finalSortBy = sortBy;
+    let finalOrder = order;
+
+    if (sort) {
+      const [field, dir] = sort.split(':');
+      if (field) finalSortBy = field as ClipSortField;
+      if (dir) finalOrder = dir as SortOrder;
+    }
+
+    return this.clipsService.listClips({
+      videoId,
+      sortBy: finalSortBy,
+      order: finalOrder,
+    });
   }
 
   /** GET /clips/:id */
   @Get(':id')
-  findOne(@Param('id') id: string) {
-    const clip = this.clipsService.findById(id);
+  async findOne(@Param('id') id: string) {
+    const clip = await this.clipsService.findById(id);
     if (!clip) throw new NotFoundException(`Clip ${id} not found`);
     return clip;
   }
